@@ -22,7 +22,7 @@ On-demand antivirus sweep for an **hMailServer** message store. ClamAV is used s
 - [Verification Before First Use](#verification-before-first-use)
 - [Usage](#usage)
 - [Parameter Reference](#parameter-reference)
-- [Scheduling](#scheduling)
+- [Unattended Operation](#unattended-operation)
 - [Run Artifacts](#run-artifacts)
 - [Exit Codes](#exit-codes)
 - [Troubleshooting](#troubleshooting)
@@ -59,6 +59,8 @@ The resident Kaspersky installation keeps running; ClamAV only reads files, so t
 - **Automatic engine selection.** Prefers `clamdscan` against a running `clamd`; falls back to `clamscan` when no daemon is available.
 - **Incremental or full sweeps.** `-SinceDays` restricts the scope by modification time; the default scans the entire store.
 - **Quarantine by default.** Every deleted message is copied to a timestamped quarantine directory first.
+- **Unattended-ready credentials.** A stored `PSCredential` or `SecureString` is discovered automatically, and `-NonInteractive` turns a missing secret into an immediate failure instead of a hung prompt.
+- **Fail-fast authentication.** Credentials are resolved *before* the scan, so a broken credential file costs seconds rather than a full sweep.
 - **Delimiter-agnostic parsing.** Verdicts are extracted with global regular expressions, because `clamdscan` on Windows does not reliably separate results with CR, LF or NUL.
 - **Honest error accounting.** Files the scanner could not read are counted separately and never reported as clean.
 - **Safety rails.** Paths outside the hMailServer `Data` directory are never deleted; non-`.eml` files are refused; orphaned files require an explicit second switch.
@@ -76,35 +78,41 @@ The resident Kaspersky installation keeps running; ClamAV only reads files, so t
   └───────────┬─────────────┘
               │
   ┌───────────▼─────────────┐
-  │ 2. Locate Data dir      │  registry InstallLocation → hMailServer.INI → Data
+  │ 2. Resolve credentials  │  parameter → path → env var → auto-discovery
   └───────────┬─────────────┘
               │
   ┌───────────▼─────────────┐
-  │ 3. Build scan scope     │  *.eml by age, UTF-8 file list for --file-list
+  │ 3. Locate Data dir      │  registry InstallLocation → hMailServer.INI → Data
   └───────────┬─────────────┘
               │
   ┌───────────▼─────────────┐
-  │ 4. Scan (detect only)   │  --no-summary --log, OEM-decoded stdout capture
+  │ 4. Build scan scope     │  *.eml by age, UTF-8 file list for --file-list
   └───────────┬─────────────┘
               │
   ┌───────────▼─────────────┐
-  │ 5. Parse verdicts       │  FOUND / ERROR / OK via global regex
+  │ 5. Scan (detect only)   │  --no-summary --log, OEM-decoded stdout capture
   └───────────┬─────────────┘
               │
   ┌───────────▼─────────────┐
-  │ 6. Match through COM    │  full path first, unique leaf name as fallback
+  │ 6. Parse verdicts       │  FOUND / ERROR / OK via global regex
   └───────────┬─────────────┘
               │
   ┌───────────▼─────────────┐
-  │ 7. Report               │  CSV + JSON + debug log
+  │ 7. Match through COM    │  full path first, unique leaf name as fallback
   └───────────┬─────────────┘
               │
   ┌───────────▼─────────────┐
-  │ 8. Quarantine & delete  │  only with -Delete, guarded by ShouldProcess
+  │ 8. Report               │  CSV + JSON + debug log
+  └───────────┬─────────────┘
+              │
+  ┌───────────▼─────────────┐
+  │ 9. Quarantine & delete  │  only with -Delete, guarded by ShouldProcess
   └─────────────────────────┘
 ```
 
 Messages are matched by absolute path. When a path cannot be matched, the file name is used **only if it is unique** among all detections; ambiguous names are skipped and reported.
+
+Step 2 runs early on purpose. A full-store sweep can take hours, and discovering a bad password afterwards wastes the entire window.
 
 ---
 
@@ -147,14 +155,21 @@ These two steps solve different problems and are intentionally not merged:
 
 Repackaging the vendor installer inside a project script would mean shipping download logic, hash verification and upgrade handling that `winget` already does correctly and safely. Conversely, `winget` cannot create the directories this configuration expects, and that omission is fatal: `freshclam` and `clamd` initialize their logger before anything else, so a missing log directory aborts them with `Failed to open log file ... No such file or directory` and the service never registers.
 
-### 3. Store the hMailServer password
+### 3. Store the hMailServer credential
+
+Export the credential once so that no password ever appears on a command line or in a task definition:
 
 ```powershell
-Read-Host -AsSecureString -Prompt 'hMailServer Administrator' |
-    Export-Clixml -LiteralPath 'C:\mail\scripts\av\hmail.cred.xml'
+$dir = Join-Path $env:ProgramData 'HMailClamAvCleanup'
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+Get-Credential -UserName 'Administrator' -Message 'hMailServer administrator' |
+    Export-Clixml -LiteralPath (Join-Path $dir 'hmail.cred.xml')
 ```
 
-DPAPI binds the file to the current user and machine. Create it under the same account that will run the scheduled task.
+The script discovers this file automatically, so `-AdminPassword` becomes optional. A `PSCredential` also carries the account name, which overrides `-AdminUser`.
+
+`Export-Clixml` protects the secret with DPAPI and binds it to **one user on one machine**. Create the file under the same account that will run the sweep — see [Unattended Operation](#unattended-operation) for the full scheduled-task walkthrough.
 
 ---
 
@@ -197,13 +212,12 @@ Get-Service -Name clamd | Select-Object Name, Status, StartType
 .\Invoke-HMailClamAvCleanup.ps1 -DiagnoseOnly -Debug
 ```
 
-Expect engine `Clamd`, `clamd instances: 1`, three signature files with a recent timestamp, and `probe exit code: 0`.
+Expect engine `Clamd`, `clamd instances: 1`, three signature files with a recent timestamp, and `probe exit code: 0`. `-DiagnoseOnly` never touches the COM API, so it needs no credential at all.
 
 **3. Parser sanity — the critical check**
 
 ```powershell
-$cred = Import-Clixml -LiteralPath 'C:\mail\scripts\av\hmail.cred.xml'
-.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -Debug -AdminPassword $cred
+.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -Debug
 ```
 
 `clean files` **must equal** `files to scan`. A mismatch means output parsing is broken and a result of `0 detections` proves nothing.
@@ -226,50 +240,61 @@ Expect `Eicar-Test-Signature FOUND` and `exit=1`. Exclude the test directory fro
 
 ## Usage
 
-```powershell
-$cred = Import-Clixml -LiteralPath 'C:\mail\scripts\av\hmail.cred.xml'
-```
+With a stored credential in place, no password argument is needed:
 
 **Report-only sweep of the last day**
 
 ```powershell
-.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -AdminPassword $cred -Debug
+.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -Debug
 ```
 
 **Full store sweep with fresh signatures**
 
 ```powershell
-.\Invoke-HMailClamAvCleanup.ps1 -AdminPassword $cred -UpdateDatabase -TimeoutMinutes 480 -Debug
+.\Invoke-HMailClamAvCleanup.ps1 -UpdateDatabase -TimeoutMinutes 480 -Debug
+```
+
+**Explicit credential from any location**
+
+```powershell
+$cred = Import-Clixml -LiteralPath 'C:\mail\scripts\av\hmail.cred.xml'
+.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -AdminPassword $cred
 ```
 
 **Include the delivery queue**
 
 ```powershell
-.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -AdminPassword $cred -IncludeQueue
+.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -IncludeQueue
 ```
 
 **Preview deletions without touching anything**
 
 ```powershell
-.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -AdminPassword $cred -Delete -WhatIf
+.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -Delete -WhatIf
 ```
 
 **Delete for real**
 
 ```powershell
-.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -AdminPassword $cred -Delete
+.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -Delete
+```
+
+**Fully unattended, no prompts under any circumstances**
+
+```powershell
+.\Invoke-HMailClamAvCleanup.ps1 -NonInteractive -Delete -DeleteOrphan -Confirm:$false
 ```
 
 **No daemon available**
 
 ```powershell
-.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -AdminPassword $cred -Engine Clamscan
+.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -Engine Clamscan
 ```
 
 **Daemon cannot read the store (different service account)**
 
 ```powershell
-.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -AdminPassword $cred -Engine Clamd -Stream
+.\Invoke-HMailClamAvCleanup.ps1 -SinceDays 1 -Engine Clamd -Stream
 ```
 
 ---
@@ -285,6 +310,17 @@ $cred = Import-Clixml -LiteralPath 'C:\mail\scripts\av\hmail.cred.xml'
 | `-ClamScanPath` | `string` | auto | Explicit path to `clamscan.exe` |
 | `-FreshclamPath` | `string` | auto | Explicit path to `freshclam.exe` |
 | `-DataDirectory` | `string` | registry | hMailServer `Data` directory |
+
+### Credentials
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `-AdminPassword` | `object` | auto-discovery | Accepts a `string`, a `securestring` or a `PSCredential`, so `Import-Clixml` output can be passed straight through |
+| `-AdminUser` | `string` | `Administrator` | Account used for COM authentication; ignored when a `PSCredential` carries a user name |
+| `-CredentialPath` | `string` | auto-discovery | Explicit path to a credential file produced by `Export-Clixml` |
+| `-NonInteractive` | `switch` | off | Never prompt; throw instead when no credential can be resolved |
+
+`-AdminPassword` is deliberately typed as `object` rather than `string`. Binding a `SecureString` to a string-typed parameter silently converts it to the literal text `System.Security.SecureString`, which authenticates against nothing and sends the script back to an interactive prompt.
 
 ### Scan behaviour
 
@@ -302,7 +338,6 @@ $cred = Import-Clixml -LiteralPath 'C:\mail\scripts\av\hmail.cred.xml'
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `-AdminPassword` | `securestring` | prompt | hMailServer Administrator password |
 | `-ReportDirectory` | `string` | `C:\mail\reports\clamav` | Root for per-run artifacts |
 | `-QuarantineDirectory` | `string` | `C:\mail\quarantine` | Root for quarantine copies |
 | `-SkipQuarantine` | `switch` | off | Delete without keeping copies |
@@ -315,21 +350,168 @@ Standard `CmdletBinding` switches apply: `-Debug`, `-Verbose`, `-WhatIf`, `-Conf
 
 ---
 
-## Scheduling
+## Unattended Operation
+
+Interactive runs prompt for the hMailServer password. A scheduled run must supply it without a console and must fail loudly when it cannot, rather than block forever on a hidden prompt.
+
+### Credential resolution order
+
+`Resolve-HMailAdminCredential` walks these sources and stops at the first hit:
+
+1. The value passed to `-AdminPassword` — `string`, `securestring` or `PSCredential`.
+2. An explicit `-CredentialPath`.
+3. The `HMAIL_CRED_PATH` environment variable.
+4. Auto-discovery of `hmail*.cred.xml`, `cred.xml` or `credential.xml` in the script directory, `.\creds\`, `%ProgramData%\HMailClamAvCleanup\` and `%LOCALAPPDATA%\HMailClamAvCleanup\`. The newest file by `LastWriteTimeUtc` wins.
+5. An interactive prompt — suppressed by `-NonInteractive`, which throws instead.
+
+Every decision is traced under the `[auth]` category in `debug.log`, so a surprising choice is easy to audit after the fact.
+
+### Step 1 — Create a dedicated service account
+
+A purpose-built local account keeps the DPAPI scope narrow and the audit trail readable:
 
 ```powershell
-$action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument @'
--NoProfile -ExecutionPolicy Bypass -Command "& { $c = Import-Clixml -LiteralPath 'C:\mail\scripts\av\hmail.cred.xml'; & 'C:\mail\scripts\av\Invoke-HMailClamAvCleanup.ps1' -SinceDays 2 -AdminPassword $c -UpdateDatabase -Delete -Confirm:$false }"
-'@ -WorkingDirectory 'C:\mail\scripts\av'
+$password = Read-Host -AsSecureString -Prompt 'Password for svc_clamav'
 
-$trigger   = New-ScheduledTaskTrigger -Daily -At '03:30'
-$principal = New-ScheduledTaskPrincipal -UserId 'DOMAIN\svc-mailav' -LogonType Password -RunLevel Highest
-$settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 6) -StartWhenAvailable
+New-LocalUser -Name 'svc_clamav' -Password $password `
+    -FullName 'ClamAV cleanup service' `
+    -Description 'Runs Invoke-HMailClamAvCleanup.ps1' `
+    -PasswordNeverExpires -AccountNeverExpires
 
-Register-ScheduledTask -TaskName 'hMail ClamAV cleanup' -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+Add-LocalGroupMember -Group 'Administrators' -Member 'svc_clamav'
 ```
 
-Run the task under the same account that created `hmail.cred.xml`, otherwise DPAPI cannot decrypt it. `-SinceDays 2` overlaps deliberately so a single missed run leaves no gap in coverage.
+Local administrator rights are not optional: the script reads the message store and instantiates the `hMailServer.Application` COM object.
+
+### Step 2 — Export the credential as that account
+
+DPAPI ties the file to one user on one machine, so it must be written from a session running as `svc_clamav`:
+
+```powershell
+# Start a shell as the service account first:
+#   runas /user:MAILSERVER\svc_clamav "pwsh.exe -NoExit"
+
+$dir = Join-Path $env:ProgramData 'HMailClamAvCleanup'
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+Get-Credential -UserName 'Administrator' -Message 'hMailServer administrator' |
+    Export-Clixml -LiteralPath (Join-Path $dir 'hmail.cred.xml')
+```
+
+### Step 3 — Restrict the ACL
+
+The script warns when the file is readable by `Everyone` or `BUILTIN\Users`, comparing well-known SIDs so the check also works on a localized Windows installation. Break inheritance and grant only what is required:
+
+```powershell
+$dir = Join-Path $env:ProgramData 'HMailClamAvCleanup'
+$acl = Get-Acl -LiteralPath $dir
+$acl.SetAccessRuleProtection($true, $false)
+
+'SYSTEM', 'Administrators', 'MAILSERVER\svc_clamav' | ForEach-Object {
+    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        $_, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+}
+
+Set-Acl -LiteralPath $dir -AclObject $acl
+```
+
+### Step 4 — Register the scheduled task
+
+```powershell
+$script = 'C:\mail\scripts\av\Invoke-HMailClamAvCleanup.ps1'
+$pwsh   = 'C:\Program Files\PowerShell\7\pwsh.exe'
+
+$argument = @(
+    '-NoProfile'
+    '-NonInteractive'
+    '-ExecutionPolicy', 'Bypass'
+    '-File', "`"$script`""
+    '-NonInteractive'
+    '-SinceDays', '2'
+    '-UpdateDatabase'
+    '-Delete'
+    '-TimeoutMinutes', '600'
+    '-Confirm:$false'
+) -join ' '
+
+$action = New-ScheduledTaskAction -Execute $pwsh -Argument $argument `
+    -WorkingDirectory (Split-Path -Parent $script)
+
+$trigger = New-ScheduledTaskTrigger -Daily -At '03:30'
+
+$settings = New-ScheduledTaskSettingsSet `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 12) `
+    -MultipleInstances IgnoreNew `
+    -StartWhenAvailable `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -RestartCount 1 -RestartInterval (New-TimeSpan -Minutes 30)
+
+$runAs = Get-Credential -UserName 'MAILSERVER\svc_clamav' -Message 'Task run-as account'
+
+Register-ScheduledTask -TaskName 'hMailServer ClamAV cleanup' `
+    -Description 'Detect-only ClamAV sweep of the hMailServer store, then delete infected messages through COM.' `
+    -Action $action -Trigger $trigger -Settings $settings `
+    -User $runAs.UserName `
+    -Password $runAs.GetNetworkCredential().Password `
+    -RunLevel Highest
+```
+
+Four details decide whether this actually survives production:
+
+- **`-User` and `-Password`, not `-Principal`.** They belong to different parameter sets of `Register-ScheduledTask`. Supplying a principal alone registers a task that silently refuses to start while nobody is logged on.
+- **`-ExecutionTimeLimit` must exceed `-TimeoutMinutes`.** Otherwise Task Scheduler kills the process mid-sweep, potentially between the quarantine copy and the COM deletion.
+- **`-MultipleInstances IgnoreNew`.** A full-store sweep can outlive its own daily interval; without this a second instance starts on top of the first.
+- **`pwsh -NonInteractive` does not suppress `Read-Host`.** Only the script's own `-NonInteractive` switch guarantees no prompt, which is why both appear above.
+
+`-SinceDays 2` overlaps deliberately, so a single missed run leaves no gap in coverage.
+
+### Step 5 — Verify the first run
+
+```powershell
+Start-ScheduledTask -TaskName 'hMailServer ClamAV cleanup'
+
+Get-ScheduledTaskInfo -TaskName 'hMailServer ClamAV cleanup' |
+    Select-Object LastRunTime, LastTaskResult, NumberOfMissedRuns
+```
+
+`LastTaskResult` of `0` means success. Then confirm how the credential was obtained:
+
+```powershell
+$run = Get-ChildItem 'C:\mail\reports\clamav' -Directory |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+Select-String -LiteralPath (Join-Path $run.FullName 'debug.log') -Pattern '\[auth\]'
+```
+
+Expected output:
+
+```
+[auth] credential file discovered: C:\ProgramData\HMailClamAvCleanup\hmail.cred.xml
+[auth] credential loaded from C:\ProgramData\HMailClamAvCleanup\hmail.cred.xml as System.Management.Automation.PSCredential
+[auth] COM identity resolved before scanning: Administrator
+```
+
+For a low-impact rehearsal, drop `-Delete` and narrow the scope with `-SinceDays 1`.
+
+### Password rotation
+
+Re-export the file as `svc_clamav`; the task needs no change because the path is unchanged:
+
+```powershell
+Get-Credential -UserName 'Administrator' -Message 'hMailServer administrator' |
+    Export-Clixml -LiteralPath "$env:ProgramData\HMailClamAvCleanup\hmail.cred.xml"
+
+.\Invoke-HMailClamAvCleanup.ps1 -NonInteractive -SinceDays 1 -Debug
+```
+
+### Alternative credential stores
+
+| Store | Use when | Caveat |
+|---|---|---|
+| `Export-Clixml` (DPAPI) | Single host with one dedicated service account | Bound to one user on one machine; unusable after a profile reset or OS reinstall |
+| `Protect-CmsMessage` | The task runs as `SYSTEM`, or several accounts need the same secret | Requires a document-encryption certificate and an ACL on its private key |
+| `SecretManagement` + `SecretStore` | Several secrets with scheduled rotation | The vault is user-scoped too; register it as the task account with authentication and interaction disabled |
+| Group Managed Service Account | Domain with multiple mail hosts | Active Directory only; the password is never exposed to the script |
 
 ---
 
@@ -378,6 +560,12 @@ A non-zero `error lines` means those files were **not** proven clean. A suspicio
 | `net start clamd` → *service name is invalid* | `clamd.exe --install` failed, usually after the logger error | Fix directories, rerun elevated, confirm with `Get-Service -Name '*clam*'` |
 | `clean files` ≠ `files to scan` | Output parsing broken | Ensure the delimiter-agnostic parser is in place; `clamdscan` on Windows does not always separate results with CR, LF or NUL |
 | `Cannot create hMailServer.Application` | COM not registered or bitness mismatch | Verify registration; `0x80040154` usually means the wrong process architecture |
+| A password prompt appears although `-AdminPassword` was supplied | An older build declared the parameter as `securestring` or `string`, so the value was stringified | Update to a build where `-AdminPassword` is `object` |
+| `Cannot read ...cred.xml ... bound to one user on one machine` | The file was exported by another account or on another host | Re-export while logged on as the account that runs the task |
+| `No hMailServer password was supplied, no credential file was found` | Auto-discovery found nothing and prompting is disabled | Pass `-CredentialPath`, set `HMAIL_CRED_PATH`, or place the file in a discovered directory |
+| `hMailServer authentication failed for the ... account` | Wrong password, or a `PSCredential` carrying an unexpected user name | Re-export the credential, or pass `-AdminUser` explicitly |
+| Scheduled task never starts while logged off | Registered with `-Principal` instead of `-User` and `-Password` | Re-register as shown in [Unattended Operation](#unattended-operation) |
+| Sweep killed part-way through | `-ExecutionTimeLimit` shorter than `-TimeoutMinutes` | Raise the task limit above the script timeout |
 | Excessive false positives | Aggressive heuristics enabled | Disable `AlertOLE2Macros`, `AlertEncryptedArchive` and `DetectPUA` in `clamd.conf` |
 | Scan finishes in seconds | `clamd` result cache | Expected; set `DisableCache yes` temporarily for a cold measurement |
 
@@ -397,7 +585,11 @@ Copying an `.eml` back into the account directory does **not** make it visible: 
 
 ## Security Considerations
 
-- The hMailServer password is never stored in the script. Use `Export-Clixml` (DPAPI) or pass a `securestring` explicitly.
+- The hMailServer password never appears in the script, in a task definition or on a command line. Store it with `Export-Clixml` (DPAPI) or pass a `securestring` or `PSCredential` explicitly.
+- Keep the credential file in a directory with inheritance disabled, readable only by `SYSTEM`, `Administrators` and the service account. The script warns when `Everyone` or `BUILTIN\Users` retains access.
+- The plaintext password exists only for the duration of the COM `Authenticate` call, and the holding variable is cleared immediately afterwards.
+- Prefer a dedicated service account over a personal one: DPAPI scope, task ownership and audit trail all stay narrow.
+- Use `-NonInteractive` for every scheduled run so a broken credential fails the task instead of hanging it invisibly.
 - The quarantine directory holds live malware. Restrict its ACL and exclude it from resident scanning deliberately, not accidentally.
 - Deletions outside the `Data` directory are refused, and non-`.eml` files are never removed.
 - Orphaned detections require both `-Delete` and `-DeleteOrphan`; the default posture reports them and stops.
@@ -411,6 +603,7 @@ Copying an `.eml` back into the account directory does **not** make it visible: 
 - Leaf-name matching is disabled for duplicate file names; only absolute paths are used in that case.
 - Detections outside the `Data` directory are reported but never deleted.
 - Deletion is irreversible outside quarantine: `DeleteByDBID` removes both the record and the file.
+- A DPAPI credential file cannot be shared between accounts or hosts; each machine and each service account needs its own export.
 - IMAP clients may need a folder compact after a bulk removal.
 
 ---
@@ -418,6 +611,7 @@ Copying an `.eml` back into the account directory does **not** make it visible: 
 ## Roadmap
 
 - [ ] Re-injection helper that restores a quarantined message through the COM API
+- [ ] Optional `SecretManagement` and DPAPI-NG credential backends for `SYSTEM`-owned tasks
 - [ ] Optional Microsoft Defender backend via `MpCmdRun.exe` for hosts where Defender runs in normal mode
 - [ ] Pester test suite covering the parser against recorded scanner output
 - [ ] Optional email or webhook notification on detection
